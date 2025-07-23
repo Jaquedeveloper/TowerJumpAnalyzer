@@ -1,4 +1,5 @@
 # 
+import bisect
 from typing import Optional
 import pandas as pd
 import numpy as np
@@ -122,138 +123,180 @@ class TowerJumpAnalyzer:
         if df.empty:
             return df
 
-        MAX_TIME_DIFF = 3600  # 1h em segundos
+        MAX_TIME_DIFF = 3600
 
-        # ---------------------------------------------
-        # 1. Estado válido
-        # ---------------------------------------------
-        df['is_state_valid'] = (
-            (df['state'] != 'UNKNOWN') &
-            df['latitude'].notna() & (df['latitude'] != 0) &
-            df['longitude'].notna() & (df['longitude'] != 0)
+        # 1. Pré-processamento básico
+        df = df.sort_values('start_time').reset_index(drop=True)
+        df['time_gap'] = (df['start_time'] - df['end_time'].shift(1)).dt.total_seconds().fillna(MAX_TIME_DIFF + 1)
+        df['group_break'] = (df['state'] != df['state'].shift(1)) | (df['time_gap'] > MAX_TIME_DIFF)
+        df['group_id'] = df['group_break'].cumsum()
+
+        # 2. Criar DataFrame reduzido apenas para grupos
+        groups = df.groupby('group_id').agg(
+            group_start=('start_time', 'min'),
+            group_end=('end_time', 'max'),
+            state=('state', 'first'),
+            latitude=('latitude', 'first'),
+            longitude=('longitude', 'first')
+        ).reset_index()
+
+        # 3. Validação de estado (apenas em grupos)
+        groups['is_valid'] = (
+            (groups['state'] != 'UNKNOWN') &
+            groups['latitude'].notna() & (groups['latitude'] != 0) &
+            groups['longitude'].notna() & (groups['longitude'] != 0)
         )
 
-        # Crie uma coluna auxiliar com o estado apenas se for válido
-        df['valid_state'] = df['state'].where(df['is_state_valid'])
+        # 4. Rastrear último grupo válido
+        groups['prev_valid_state'] = None
+        groups['prev_valid_lat'] = None
+        groups['prev_valid_lon'] = None
+        groups['prev_valid_end'] = pd.NaT
+        
+        last_valid = {
+            'state': None,
+            'lat': None,
+            'lon': None,
+            'end': None
+        }
 
-        # Inicializa vetor vazio
-        previous_different = [None] * len(df)
+        for i, row in groups.iterrows():
+            if row['is_valid']:
+                groups.at[i, 'prev_valid_state'] = last_valid['state']
+                groups.at[i, 'prev_valid_lat'] = last_valid['lat']
+                groups.at[i, 'prev_valid_lon'] = last_valid['lon']
+                groups.at[i, 'prev_valid_end'] = last_valid['end']
+                
+                # Atualizar último válido
+                last_valid = {
+                    'state': row['state'],
+                    'lat': row['latitude'],
+                    'lon': row['longitude'],
+                    'end': row['group_end']
+                }
 
-        last_valid_state = None
-        for i in range(len(df)):
-            current_state = df.loc[i, 'state']
-            if pd.notna(df.loc[i, 'valid_state']):
-                if last_valid_state is not None and last_valid_state != current_state:
-                    previous_different[i] = last_valid_state
-                last_valid_state = df.loc[i, 'valid_state']
+        # 5. Filtrar apenas grupos válidos para cálculos físicos
+        valid_groups = groups[groups['is_valid']].copy()
+        valid_groups = valid_groups[valid_groups['prev_valid_state'].notna()]  # Ignorar primeiro válido
+
+        # 6. Cálculos temporais e de movimento (apenas em válidos)
+        valid_groups['time_diff'] = (valid_groups['group_start'] - valid_groups['prev_valid_end']).dt.total_seconds()
+        
+        # 6. Cálculo de distância e velocidade (função Haversine)
+        def haversine_vectorized(lon1, lat1, lon2, lat2):
+            lon1 = np.radians(lon1.astype(float))
+            lat1 = np.radians(lat1.astype(float))
+            lon2 = np.radians(lon2.astype(float))
+            lat2 = np.radians(lat2.astype(float))
+            
+            dlon = lon2 - lon1
+            dlat = lat2 - lat1
+
+            a = np.sin(dlat / 2.0) ** 2 + \
+                np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+            c = 2 * np.arcsin(np.sqrt(a))
+            km = 6371 * c
+            return km
+
+        valid_groups['distance'] = haversine_vectorized(
+            valid_groups['prev_valid_lon'],
+            valid_groups['prev_valid_lat'],
+            valid_groups['longitude'],
+            valid_groups['latitude']
+        )
+    
+        valid_groups['speed'] = valid_groups['distance'] * 3600 / valid_groups['time_diff']
+        valid_groups['is_movement_possible'] = (valid_groups['distance'] > 0) & (valid_groups['speed'] < 1000)
+        
+        # 7. Detecção de anomalias
+        valid_groups['state_changed'] = valid_groups['state'] != valid_groups['prev_valid_state']
+        valid_groups['valid_state_change_1h'] = valid_groups['state_changed'] & (valid_groups['time_diff'] <= MAX_TIME_DIFF)
+        anomaly_candidates = valid_groups[valid_groups['valid_state_change_1h'] & ~valid_groups['is_movement_possible']].copy()
+
+        # Inicializar colunas de anomalia
+        valid_groups['tower_jump'] = False
+        valid_groups['anomaly_type'] = 'NONE'
+        valid_groups['conflict_resolution'] = 'NO_CONFLICT'
+        valid_groups['historical_state'] = None
+        valid_groups['historical_state_time'] = None
+
+        # Preparar lista de registros válidos para busca histórica
+        # Usamos apenas grupos válidos com índice original
+        valid_records = []
+        for _, row in valid_groups.iterrows():
+            valid_records.append((row['group_start'], row.name, row['state']))
+        valid_records.sort(key=lambda x: x[0])  # Ordenar por tempo
+        valid_times = [vr[0] for vr in valid_records]
+
+        # Busca binária otimizada para cada candidato
+        for idx, candidate in anomaly_candidates.iterrows():
+            current_time = candidate['group_start']
+            base_state = candidate['prev_valid_state']
+            current_state = candidate['state']
+            
+            # Janela temporal: até 1h antes do grupo atual
+            low_bound = current_time - pd.Timedelta(seconds=MAX_TIME_DIFF)
+            
+            # Encontrar índices na lista ordenada
+            left_idx = bisect.bisect_left(valid_times, low_bound)
+            right_idx = bisect.bisect_right(valid_times, current_time) - 1
+            
+            historical_match = None
+            
+            # Procurar do mais recente para o mais antigo
+            if left_idx <= right_idx:
+                for pos in range(right_idx, left_idx - 1, -1):
+                    record_time, record_idx, record_state = valid_records[pos]
+                    
+                    # Ignorar o próprio grupo e grupos posteriores
+                    if record_idx >= idx:
+                        continue
+                        
+                    # Critério de compatibilidade:
+                    # 1. Estado diferente do estado anterior (base_state)
+                    # 2. Mesmo estado do grupo atual (current_state)
+                    if record_state != base_state and record_state == current_state:
+                        historical_match = (record_idx, record_state, record_time)
+                        break
+            
+            # Classificação de anomalias
+            if historical_match is None:
+                valid_groups.at[idx, 'tower_jump'] = True
+                valid_groups.at[idx, 'anomaly_type'] = 'NO_HISTORICAL_SUPPORT'
             else:
-                previous_different[i] = last_valid_state if last_valid_state != current_state else None
-
-        df['previous_valid_different_state'] = previous_different
-
-        next_different = [None] * len(df)
-
-        next_valid_state = None
-        for i in reversed(range(len(df))):
-            current_state = df.loc[i, 'state']
-            if pd.notna(df.loc[i, 'valid_state']):
-                if next_valid_state is not None and next_valid_state != current_state:
-                    next_different[i] = next_valid_state
-                next_valid_state = df.loc[i, 'valid_state']
-            else:
-                next_different[i] = next_valid_state if next_valid_state != current_state else None
-
-        df['next_valid_different_state'] = next_different
-
-        # ---------------------------------------------
-        # 2. Colunas de tempo e comparação
-        # ---------------------------------------------
-        df['prev_state'] = df['state'].shift(1).fillna('UNKNOWN')
-        df['prev_end_time'] = df['end_time'].shift(1)
-        df['prev_lat'] = df['latitude'].shift(1)
-        df['prev_lon'] = df['longitude'].shift(1)
-        df['prev_is_valid'] = df['is_state_valid'].shift(1).fillna(False)
-
-        df['time_diff'] = (df['start_time'] - df['prev_end_time']).dt.total_seconds()
-        df['state_changed'] = df['state'] != df['prev_state']
-        df['valid_state_change'] = df['state_changed'] & df['is_state_valid'] & df['prev_is_valid']
-        df['valid_state_change_1h'] = df['valid_state_change'] & (df['time_diff'] <= MAX_TIME_DIFF)
-
-        # ---------------------------------------------
-        # 3. Cálculo vetorizado de distância e velocidade
-        # ---------------------------------------------
-        valid_movement_mask = df['is_state_valid'] & df['prev_is_valid'] & (df['time_diff'] > 0)
-
-        df['distance'] = 0.0
-        df['speed'] = 0.0
-        df['duration'] = df['time_diff']
-        df.loc[valid_movement_mask, 'distance'] = self.haversine_distance_vectorized(
-            df.loc[valid_movement_mask, 'prev_lon'],
-            df.loc[valid_movement_mask, 'prev_lat'],
-            df.loc[valid_movement_mask, 'longitude'],
-            df.loc[valid_movement_mask, 'latitude']
+                rec_idx, hist_state, hist_time = historical_match
+                valid_groups.at[idx, 'tower_jump'] = True
+                valid_groups.at[idx, 'anomaly_type'] = 'HISTORICAL_CONFLICT'
+                valid_groups.at[idx, 'historical_state'] = hist_state
+                valid_groups.at[idx, 'historical_state_time'] = hist_time
+                
+                # Verificar recuperação automática
+                next_idx = idx + 1
+                if next_idx in valid_groups.index and valid_groups.loc[next_idx, 'state'] == base_state:
+                    valid_groups.at[idx, 'conflict_resolution'] = 'AUTO_RECOVERY'
+                
+        # 8. Mesclar resultados de volta ao DataFrame original
+        df = df.merge(
+            groups[['group_id', 'prev_valid_state', 'prev_valid_lat', 'prev_valid_lon', 'prev_valid_end']],
+            on='group_id',
+            how='left'
         )
-        df.loc[valid_movement_mask, 'speed'] = (
-            df.loc[valid_movement_mask, 'distance'] * 3600 / df.loc[valid_movement_mask, 'time_diff']
+        
+        df = df.merge(
+            valid_groups[['group_id', 'distance', 'speed', 'is_movement_possible', 'anomaly_type', 'tower_jump']],
+            on='group_id',
+            how='left'
+        ).fillna({'distance': 0, 'speed': 0, 'is_movement_possible': True, 'tower_jump': False})
+        
+        # 9. Preencher colunas derivadas restantes
+        df['physical_consistency'] = np.where(
+            df['tower_jump'],
+            'INCONSISTENT',
+            'CONSISTENT'
         )
-
-        df['is_movement_possible'] = (
-            (df['distance'] > 0) &
-            (df['speed'] > 0) &
-            ((df['speed'] * (df['time_diff'] / 3600)) >= df['distance'])
-        )
-
-        # ---------------------------------------------
-        # 4. Inicializar colunas auxiliares
-        # ---------------------------------------------
-        df['tower_jump'] = False
-        df['conflict_resolution'] = 'NO_CONFLICT'
-        df['discarded_state'] = None
-        df['resolved_by'] = None
-        df['older_state'] = None
-        df['older_state_index'] = None
-
-        # ---------------------------------------------
-        # 5. Loop apenas onde há mudança válida de estado
-        # ---------------------------------------------
-        candidates = df[df['valid_state_change_1h'] & (~df['is_movement_possible'])]
-
-        for i in candidates.index:
-            row = df.loc[i]
-            base_state = row['prev_state']
-            current_time = row['start_time']
-
-            # Busca de estado histórico diferente (até 1h antes)
-            older_idx = None
-            for j in range(i - 1, max(i - 1000, -1), -1):
-                candidate = df.loc[j]
-                if not candidate['is_state_valid']:
-                    continue
-                if abs((candidate['start_time'] - current_time).total_seconds()) > MAX_TIME_DIFF:
-                    break
-                if candidate['state'] != base_state:
-                    older_idx = j
-                    break
-
-            historical_divergence = (
-                older_idx is not None and
-                row['state'] != df.at[older_idx, 'state']
-            )
-
-            if older_idx is None or historical_divergence:
-                df.at[i, 'tower_jump'] = True
-                df.at[i, 'conflict_resolution'] = 'STATE_DIVERGENCE'
-                df.at[i, 'discarded_state'] = base_state
-                df.at[i, 'resolved_by'] = 'DISTANCE_TIME_ANALYSIS'
-                df.at[i, 'older_state_index'] = older_idx
-                df.at[i, 'older_state'] = df.at[older_idx, 'state'] if older_idx is not None else None
-
-                # Verificação do estado posterior
-                if i + 1 < len(df) and df.at[i + 1, 'state'] == base_state:
-                    df.at[i, 'conflict_resolution'] = 'STATE_RECOVERY'
-
+        
         return df
-
+ 
     def load_data(self, file_path):
         """Carrega e processa os dados do arquivo CSV usando pandas"""
         try:
@@ -297,19 +340,7 @@ class TowerJumpAnalyzer:
                         'end_time': start_time,
                         'latitude': lat,
                         'longitude': lon,
-                        'state': state,
-                        'discarded_state': None,
-                        'confidence': 100,
-                        'same_time_diff_state': False,
-                        'duration': 0,
-                        'speed': 0,
-                        'distance': 0,
-                        'vehicle_type': 'UNKNOWN',
-                        'movement_possible': False,
-                        'tower_jump': False,
-                        'conflict_resolution': 'NO_CONFLICT',
-                        'resolved_by': None,
-                        'location_score': 0                        
+                        'state': state,                     
                     }
                     
                     processed_data.append(entry)
@@ -362,47 +393,110 @@ class TowerJumpAnalyzer:
         if speed is None or np.isnan(speed):
             return ''
         return f"{speed:.2f} km/h" if speed >= 0 else ''
+    
+    import traceback
 
     def generate_report(self, df, output_file):
-        """Gera um relatório CSV com os dados processados"""
+        """Gera um relatório CSV com todas as colunas processadas"""
         if df.empty:
             print("Nenhum dado para gerar relatório")
             return False
 
         try:
-            # Formata as colunas de data/hora
-            df['start_time_str'] = df['start_time'].dt.strftime(self.date_format)
-            df['end_time_str'] = df['end_time'].dt.strftime(self.date_format)
+            # 1. Formatar todas as colunas de data/hora
+            datetime_cols = df.select_dtypes(include=['datetime64[ns]']).columns
+            for col in datetime_cols:
+                df[f'{col}_str'] = df[col].dt.strftime(self.date_format)
             
-            # Formata as colunas numéricas
+            # 2. Formatar colunas numéricas específicas
             df['speed_str'] = df['speed'].apply(self.format_speed)
             df['distance_str'] = df['distance'].apply(self.format_distance)
-
-            # Prepara o DataFrame para exportação
-            export_df = df[[
-                'start_time_str', 'end_time_str', 'latitude', 'longitude',
-                'state', 'discarded_state',
-                'duration', 'speed_str', 'distance_str', 'vehicle_type', 
-                'movement_possible', 'tower_jump', 'conflict_resolution', 
-                'resolved_by', 'location_score', 'confidence'
-            ]]
             
-            # Renomeia as colunas
-            export_df = export_df.rename(columns={
+            # 3. Preparar lista de todas as colunas para exportação
+            all_columns = list(df.columns)
+            
+            # 4. Reordenar colunas para priorizar informações principais
+            priority_columns = [
+                'start_time_str', 'end_time_str', 'group_start_str', 'group_end_str',
+                'state', 'anomaly_summary', 'tower_jump', 'physical_consistency',
+                'conflict_resolution', 'anomaly_type', 'prev_group_state', 'historical_state', 'latitude', 'longitude', 'group_lat', 'group_lon',
+                'speed_str', 'distance_str', 'is_movement_possible'
+            ]
+            
+            # 5. Criar lista ordenada de colunas (prioritárias + demais)
+            export_columns = [col for col in priority_columns if col in all_columns]
+            remaining_columns = [col for col in all_columns if col not in priority_columns and not col.endswith('_str')]
+            export_columns += sorted(remaining_columns)
+            
+            # 6. Preparar DataFrame para exportação
+            export_df = df[export_columns]
+            
+            # 7. Renomear colunas formatadas para nomes amigáveis
+            rename_map = {
                 'start_time_str': 'start_time',
                 'end_time_str': 'end_time',
+                'group_start_str': 'group_start',
+                'group_end_str': 'group_end',
                 'speed_str': 'speed',
-                'distance_str': 'distance'
-            })
+                'distance_str': 'distance',
+                'prev_group_state': 'previous_state',
+                'group_lat': 'group_latitude',
+                'group_lon': 'group_longitude'
+            }
+            export_df = export_df.rename(columns=rename_map)
             
-            # Exporta para CSV
+            # 8. Exportar para CSV
             export_df.to_csv(output_file, index=False)
+            print(f"Relatório gerado com sucesso: {output_file}")
+            print(f"Total de colunas exportadas: {len(export_columns)}")
+            print(f"Total de registros: {len(export_df)}")
             return True
             
         except Exception as e:
             print(f"Erro ao gerar relatório: {str(e)}")
             traceback.print_exc()
             return False
+
+    # def generate_report(self, df, output_file):
+    #     """Gera um relatório CSV com os dados processados"""
+    #     if df.empty:
+    #         print("Nenhum dado para gerar relatório")
+    #         return False
+
+    #     try:
+    #         # Formata as colunas de data/hora
+    #         df['start_time_str'] = df['start_time'].dt.strftime(self.date_format)
+    #         df['end_time_str'] = df['end_time'].dt.strftime(self.date_format)
+            
+    #         # Formata as colunas numéricas
+    #         df['speed_str'] = df['speed'].apply(self.format_speed)
+    #         df['distance_str'] = df['distance'].apply(self.format_distance)
+
+    #         # Prepara o DataFrame para exportação
+    #         export_df = df[[
+    #             'start_time_str', 'end_time_str', 'latitude', 'longitude',
+    #             'state', 'discarded_state',
+    #             'duration', 'speed_str', 'distance_str', 'vehicle_type', 
+    #             'movement_possible', 'tower_jump', 'conflict_resolution', 
+    #             'resolved_by', 'location_score', 'confidence'
+    #         ]]
+            
+    #         # Renomeia as colunas
+    #         export_df = export_df.rename(columns={
+    #             'start_time_str': 'start_time',
+    #             'end_time_str': 'end_time',
+    #             'speed_str': 'speed',
+    #             'distance_str': 'distance'
+    #         })
+            
+    #         # Exporta para CSV
+    #         export_df.to_csv(output_file, index=False)
+    #         return True
+            
+    #     except Exception as e:
+    #         print(f"Erro ao gerar relatório: {str(e)}")
+    #         traceback.print_exc()
+    #         return False
 
     def print_summary(self, df):
         """Imprime um resumo dos dados processados"""
