@@ -18,20 +18,12 @@ class TowerJumpAnalyzer:
         except (ValueError, TypeError):
             return 0
 
-    def is_movement_possible(self, distance, speed):  
-        MAX_REALISTIC_SPEED = 200  # km/h
-        MIN_DISTANCE_FOR_HIGH_SPEED = 30  # km
-        MAX_SPEED_FOR_SHORT_DISTANCE = 130  # km/h
-
-        if pd.isna(distance) or pd.isna(speed):
-            return False
-        if speed == 0 or distance == 0:
-            return False
-        if speed <= MAX_SPEED_FOR_SHORT_DISTANCE and distance < 50:
-            return True
-        if distance >= MIN_DISTANCE_FOR_HIGH_SPEED and speed <= MAX_REALISTIC_SPEED:
-            return True
-        return False
+    def is_movement_possible(self, dist_km, time_sec, max_speed_kmh=300):
+        """Verifica se o deslocamento entre dois pontos é possível fisicamente."""
+        max_speed_mps = (max_speed_kmh * 1000) / 3600
+        time_sec = time_sec.replace(0, np.nan)  # evitar divisão por zero
+        speed_mps = (dist_km * 1000) / time_sec
+        return speed_mps <= max_speed_mps
 
     
     def haversine_vectorized(self, lon1, lat1, lon2, lat2):
@@ -63,26 +55,22 @@ class TowerJumpAnalyzer:
         return df
 
     def _assign_group_ids(self, df):
-        """Atribui group_id apenas para registros válidos."""
-        df['group_id'] = pd.NA  # Inicializa com NA
+        """Atribui IDs de grupo apenas para registros válidos com mudança de estado."""
+        df['prev_valid_state'] = df['valid_state'].ffill().shift()
+        df['state_change'] = (
+            df['valid_state'].notna() & (df['valid_state'] != df['prev_valid_state'])
+        )
 
-        # Subset válido
-        df_valid = df[df['is_valid']].copy()
-        df_valid['prev_state'] = df_valid['valid_state'].shift()
-        df_valid['state_change'] = df_valid['valid_state'] != df_valid['prev_state']
-        df_valid['group_id'] = df_valid['state_change'].cumsum()
-
-        # Junta de volta ao DataFrame original
-        df.loc[df_valid.index, 'state_change'] = df_valid['state_change']
-        df.loc[df_valid.index, 'group_id'] = df_valid['group_id']
+        df['group_id'] = df['state_change'].cumsum()
+        df.loc[~df['is_valid'], 'group_id'] = pd.NA
 
         return df
 
     def _analyze_valid_groups(self, df):
-        """Calcula informações dos grupos válidos, incluindo tower_jump e duração."""
-        valid_groups = df[df['group_id'].notna()].copy()
+        """Agrupa registros válidos, calcula distância, tempo e marca tower jumps."""
+        valid = df[df['group_id'].notna()].copy()
 
-        group_info = valid_groups.groupby('group_id').agg({
+        group_info = valid.groupby('group_id').agg({
             'valid_state': 'first',
             'latitude': 'first',
             'longitude': 'first',
@@ -95,35 +83,18 @@ class TowerJumpAnalyzer:
             'end_time': 'group_end_time'
         })
 
-        # Calcula duração do grupo
         group_info['duration'] = (
             group_info['group_end_time'] - group_info['group_start_time']
         ).dt.total_seconds()
 
-        # Inicializa a coluna de tower_jump
-        group_info['tower_jump'] = False
+        group_info['prev_state'] = group_info['valid_state'].shift()
+        group_info['tower_jump'] = np.where(
+            (group_info['valid_state'] != group_info['prev_state']) &
+            (group_info['group_id'] != group_info['group_id'].min()),
+            True,
+            pd.NA
+        )
 
-        # Rastreia o último estado não jump
-        last_valid_state = None
-        for i in group_info.index:
-            current_state = group_info.at[i, 'valid_state']
-            if pd.isna(current_state):
-                continue
-
-            if last_valid_state is None:
-                last_valid_state = current_state
-                continue
-
-            if current_state != last_valid_state:
-                group_info.at[i, 'tower_jump'] = True
-            else:
-                group_info.at[i, 'tower_jump'] = False
-
-            # Atualiza last_valid_state apenas se **não for jump**
-            if not group_info.at[i, 'tower_jump']:
-                last_valid_state = current_state
-
-        # Calcula tempo e distância entre grupos
         group_info['time_diff'] = (
             group_info['group_start_time'] - group_info['group_end_time'].shift()
         ).dt.total_seconds()
@@ -135,47 +106,58 @@ class TowerJumpAnalyzer:
 
         return df, group_info
 
-
     def _map_group_info(self, df, group_info):
-        """Mapeia informações de grupo para o DataFrame original."""
-        for col in ['tower_jump', 'group_start_time', 'group_end_time']:
+        """Mapeia informações do grupo de volta para o dataframe original."""
+        map_cols = ['tower_jump', 'group_start_time', 'group_end_time', 'duration',
+                    'distance_km', 'time_diff', 'confidence', 'confidence_display']
+
+        for col in map_cols:
             df[col] = df['group_id'].map(group_info.set_index('group_id')[col])
-        df['tower_jump'] = df['tower_jump'].fillna(False)
+
         return df
     
     def detect_jumps_novo(self, df):
-        """Detecta e agrupa estados válidos consecutivos, calculando tempo, distância e tower jumps."""
+        """Detecta e agrupa estados válidos consecutivos, calculando tempo, distância, 
+        duração e tower jumps com confiança."""
         if df.empty:
             return df
 
         df = self._preprocess_dataframe(df)
         df = self._assign_group_ids(df)
         df, group_info = self._analyze_valid_groups(df)
+
+        group_info['is_movement_possible'] = self.is_movement_possible(
+            group_info['distance_km'], group_info['time_diff']
+        )
+
+        group_info = self.calculate_confidence(group_info)
         df = self._map_group_info(df, group_info)
 
         return df
 
     def calculate_confidence(self, groups):
+        """Calcula a confiança na detecção de tower jumps."""
         groups['confidence'] = 0.0
 
-        for idx in groups[groups['tower_jump']].index:
-            confidence_score = 0.0
-            
-            if groups.at[idx, 'is_movement_possible'] == True:
-                confidence_score += 0.30
-            
-            if groups.at[idx, 'anomaly_type'] == 'NO_HISTORICAL_SUPPORT':
-                confidence_score += 0.25
-            
-            if groups.at[idx, 'conflict_resolution'] == 'AUTO_RECOVERY':
-                confidence_score += 0.2
-            
-            groups.at[idx, 'confidence'] = min(confidence_score, 1.0) * 100
+        cond_jump = groups['tower_jump'] == True
+        groups_jump = groups[cond_jump].copy()
 
-        groups['confidence_display'] = groups['confidence'].round(1).astype(str) + '%'
+        base_score = 0.0
+        movement_bonus = 0.30
+        distance_bonus = 0.20
+        duration_bonus = 0.10
+
+        score = (
+            movement_bonus * groups_jump['is_movement_possible'].fillna(False).astype(float) +
+            distance_bonus * (groups_jump['distance_km'] > 100).astype(float) +
+            duration_bonus * (groups_jump['duration'] < 600).astype(float)
+        )
+
+        groups.loc[cond_jump, 'confidence'] = (score.clip(0, 1.0) * 100).round(1)
+        groups['confidence_display'] = groups['confidence'].astype(str) + '%'
 
         return groups
-    
+
     def load_data(self, file_path):
         """ Loads and process data to pandas dataframe """
         try:
@@ -279,7 +261,8 @@ class TowerJumpAnalyzer:
             
             # 4. Reordenar colunas para priorizar informações principais
             priority_columns = [
-                'start_time_str', 'end_time_str', 'is_valid', 'state', 'valid_state', 'state_change', 'tower_jump',
+                'start_time_str', 'end_time_str', 'is_valid', 'state', 'valid_state', 
+                'state_change', 'prev_valid_state', 'fwd_valid_state', 'tower_jump',
                 'group_id', 'group_start_time', 'group_end_time', 'duration'
             ]
                     
