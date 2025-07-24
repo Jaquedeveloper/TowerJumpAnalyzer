@@ -116,6 +116,32 @@ class TowerJumpAnalyzer:
 
         return df
     
+    def adjust_sandwiched_jumps(self, group_info):
+        """Corrige falsos Tower Jumps quando um grupo está sanduichado entre dois grupos do mesmo estado,
+        apenas se o estado atual for diferente do estado que será propagado."""
+        group_info = group_info.reset_index(drop=True)
+        
+        group_info['prev_valid_state'] = group_info['valid_state'].shift(1)
+        group_info['next_valid_state'] = group_info['valid_state'].shift(-1)
+        
+        # Nova condição: verifica se o estado atual é diferente do estado que será propagado
+        mask = (
+            group_info['tower_jump'] & 
+            (group_info['prev_valid_state'] == group_info['next_valid_state']) & 
+            group_info['prev_valid_state'].notna() &
+            (group_info['valid_state'] != group_info['prev_valid_state'])  # REGRA ADICIONADA
+        )
+        
+        # Ajusta apenas grupos onde o estado atual é diferente do propagado
+        group_info.loc[mask, 'valid_state'] = group_info.loc[mask, 'prev_valid_state']
+        
+        # Recalcula flags de Tower Jump
+        group_info['prev_state'] = group_info['valid_state'].shift(1)
+        group_info['tower_jump'] = (group_info['valid_state'] != group_info['prev_state']) & (group_info.index > 0)
+        
+        group_info = group_info.drop(columns=['prev_valid_state', 'next_valid_state', 'prev_state'])
+        return group_info
+
     def detect_jumps_novo(self, df):
         """Detecta e agrupa estados válidos consecutivos, calculando tempo, distância, 
         duração e tower jumps com confiança."""
@@ -130,9 +156,51 @@ class TowerJumpAnalyzer:
             group_info['distance_km'], group_info['time_diff']
         )
 
-        group_info = self.calculate_confidence(group_info)
+        # Passo crítico com nova regra
+        group_info = self.adjust_sandwiched_jumps(group_info)
+
+        # Aplica correção de Tower Jumps sanduichados
+        # group_info = self.adjust_sandwiched_jumps(group_info)  # NOVO PASSO
+        group_info = self.calculate_confidence(group_info)     # Confiança após ajustes
+
         df = self._map_group_info(df, group_info)
 
+        return df
+    
+    def resolve_state_by_temporal_proximity(self, df):
+        """
+        Ajusta o estado válido de cada grupo considerando a proximidade temporal.
+        Mantém o estado anterior se o intervalo do novo estado não for suficientemente longo.
+        """
+        # Agrupa por group_id e calcula os intervalos de tempo entre grupos
+        group_info = df.groupby('group_id').agg({
+            'group_start_time': 'first',
+            'group_end_time': 'last',
+            'valid_state': 'first',
+            'tower_jump': 'first'
+        }).reset_index()
+
+        # Calcula a diferença de tempo entre grupos consecutivos
+        group_info['prev_end_time'] = group_info['group_end_time'].shift()
+        group_info['next_start_time'] = group_info['group_start_time'].shift(-1)
+
+        group_info['interval_to_prev'] = (group_info['group_start_time'] - group_info['prev_end_time']).dt.total_seconds().abs()
+        group_info['interval_to_next'] = (group_info['next_start_time'] - group_info['group_end_time']).dt.total_seconds().abs()
+
+        # Aplica a lógica de proximidade temporal
+        for idx in group_info.index:
+            if group_info.loc[idx, 'tower_jump'] is True:
+                prev_interval = group_info.loc[idx, 'interval_to_prev']
+                next_interval = group_info.loc[idx, 'interval_to_next']
+                # Se o intervalo para o estado anterior for menor, mantém o estado anterior
+                if pd.notna(prev_interval) and (prev_interval < next_interval or pd.isna(next_interval)):
+                    # Atualiza o estado válido do grupo atual para o estado anterior
+                    prev_state = group_info.loc[idx - 1, 'valid_state'] if idx > 0 else group_info.loc[idx, 'valid_state']
+                    group_info.loc[idx, 'valid_state'] = prev_state
+
+        # Mapeia de volta para o dataframe original
+        state_map = group_info.set_index('group_id')['valid_state']
+        df['valid_state_temporal'] = df['group_id'].map(state_map)
         return df
 
     def calculate_confidence(self, groups):
@@ -262,8 +330,8 @@ class TowerJumpAnalyzer:
             # 4. Reordenar colunas para priorizar informações principais
             priority_columns = [
                 'start_time_str', 'end_time_str', 'is_valid', 'state', 'valid_state', 
-                'state_change', 'prev_valid_state', 'fwd_valid_state', 'tower_jump',
-                'group_id', 'group_start_time', 'group_end_time', 'duration'
+                'state_change', 'tower_jump', 'is_movement_possible', 'prev_valid_state', 
+                'fwd_valid_state', 'group_id', 'group_start_time', 'group_end_time', 'duration'
             ]
                     
             # 5. Criar lista ordenada de colunas (prioritárias + demais)
@@ -325,7 +393,6 @@ def main():
     input_file = os.path.join(data_dir, "CarrierData.csv")
     output_file_name = 'TowerJumpReport.csv'
     output_file = os.path.join(base_dir, output_file_name)
-    output_file2 = os.path.join(base_dir, 'result.csv')
 
     if not os.path.exists(input_file):
         print(f"Erro: Arquivo de entrada não encontrado em {input_file}")
@@ -342,6 +409,7 @@ def main():
 
     print("Detectando tower jumps...")
     df = analyzer.detect_jumps_novo(df)
+    # df = analyzer.resolve_state_by_temporal_proximity(df)
 
     print("Gerando relatório...")
     if analyzer.generate_report(df, output_file):
