@@ -1,5 +1,4 @@
 # 
-import bisect
 import pandas as pd
 import numpy as np
 import os
@@ -18,12 +17,51 @@ class TowerJumpAnalyzer:
         except (ValueError, TypeError):
             return 0
 
-    def is_movement_possible(self, dist_km, time_sec, max_speed_kmh=300):
-        """Verifica se o deslocamento entre dois pontos é possível fisicamente."""
-        max_speed_mps = (max_speed_kmh * 1000) / 3600
-        time_sec = time_sec.replace(0, np.nan)  # evitar divisão por zero
-        speed_mps = (dist_km * 1000) / time_sec
-        return speed_mps <= max_speed_mps
+    def _calculate_distance_and_speed_vectorized(self, lat1_deg, lon1_deg, lat2_deg, lon2_deg, tempo_segundos):
+        """Calculates distance in km and average speed in km/h between points.
+        
+        Args:
+            lat1_deg: Series of latitudes for point 1 (degrees)
+            lon1_deg: Series of longitudes for point 1 (degrees)
+            lat2_deg: Series of latitudes for point 2 (degrees)
+            lon2_deg: Series of longitudes for point 2 (degrees)
+            tempo_segundos: Series of elapsed times (seconds)
+            
+        Returns:
+            tuple: (distance_km, speed_kmh) as pandas Series
+        """
+        # Convert degrees to radians
+        lat1_rad = np.radians(lat1_deg)
+        lon1_rad = np.radians(lon1_deg)
+        lat2_rad = np.radians(lat2_deg)
+        lon2_rad = np.radians(lon2_deg)
+        
+        # Calculate differences in coordinates
+        delta_lon = lon2_rad - lon1_rad
+        
+        # Compute trigonometric values
+        sin_lat1 = np.sin(lat1_rad)
+        cos_lat1 = np.cos(lat1_rad)
+        sin_lat2 = np.sin(lat2_rad)
+        cos_lat2 = np.cos(lat2_rad)
+        cos_delta_lon = np.cos(delta_lon)
+        
+        # Calculate central angle using spherical law of cosines
+        cos_angle = sin_lat1 * sin_lat2 + cos_lat1 * cos_lat2 * cos_delta_lon
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)  # Ensure valid domain for arccos
+        
+        # Calculate distances
+        R = 6371  # Earth radius in km
+        distances = R * np.arccos(cos_angle)
+        
+        # Calculate speeds (handle zero/negative time)
+        speeds = np.where(
+            tempo_segundos > 0,
+            (distances * 3600) / tempo_segundos,
+            0.0
+        )
+        
+        return distances, speeds
     
     def is_movement_possible_vectorized(self, dist_km, time_sec, max_speed_kmh=900):
         """Verifica se o deslocamento entre dois pontos é possível fisicamente (versão vetorizada)."""
@@ -44,22 +82,6 @@ class TowerJumpAnalyzer:
         speed_mps[~valid_mask] = np.inf
         
         return speed_mps <= max_speed_mps
-
-    
-    def haversine_vectorized(self, lon1, lat1, lon2, lat2):
-        lon1 = np.radians(lon1.astype(float))
-        lat1 = np.radians(lat1.astype(float))
-        lon2 = np.radians(lon2.astype(float))
-        lat2 = np.radians(lat2.astype(float))
-
-        dlon = lon2 - lon1
-        dlat = lat2 - lat1
-
-        a = np.sin(dlat / 2.0) ** 2 + \
-            np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-        c = 2 * np.arcsin(np.sqrt(a))
-        km = 6371 * c
-        return km
 
     def _preprocess_dataframe(self, df):
         """Ordena, preenche campos e marca registros válidos."""
@@ -87,7 +109,30 @@ class TowerJumpAnalyzer:
         df.loc[~df['is_valid'], 'group_id'] = pd.NA
 
         return df
+    
+    def _detect_move(self, group_info):
+        group_info['time_diff'] = (
+            group_info['group_start_time'] - group_info['group_end_time'].shift()
+        ).dt.total_seconds()
 
+        distance_km, speed_kmh = self._calculate_distance_and_speed_vectorized(
+            group_info['latitude'].shift(),
+            group_info['longitude'].shift(), 
+            group_info['latitude'],            
+            group_info['longitude'], 
+            group_info['time_diff']
+        )
+
+        group_info['distance_km'] = distance_km
+        group_info['speed_kmh'] = speed_kmh
+
+        group_info['is_movement_possible'] = self.is_movement_possible_vectorized(
+            group_info['distance_km'], 
+            group_info['time_diff']
+        )
+
+        return group_info
+    
     def _analyze_valid_groups(self, df):
         """Agrupa registros válidos, calcula distância, tempo e marca tower jumps."""
         valid = df[df['group_id'].notna()].copy()
@@ -111,37 +156,17 @@ class TowerJumpAnalyzer:
         ).dt.total_seconds()
         
         group_info['prev_group_state'] = group_info['group_state'].shift()
-
         group_info['next_group_state'] = group_info['group_state'].shift(-1)
-
-        group_info['time_diff'] = (
-            group_info['group_start_time'] - group_info['group_end_time'].shift()
-        ).dt.total_seconds()
-
-        group_info['distance_km'] = self.haversine_vectorized(
-            group_info['longitude'].shift(), 
-            group_info['latitude'].shift(),
-            group_info['longitude'], 
-            group_info['latitude']
-        )
-
-        group_info['is_movement_possible'] = self.is_movement_possible_vectorized(
-            group_info['distance_km'], 
-            group_info['time_diff']
-        )
-
         group_info['tower_jump'] = False
 
         print('Detecting tower jumps...')
         group_info['tower_jump'] = np.where(
             (group_info['group_state'] != group_info['prev_group_state']) &
-            (group_info['prev_group_state'] == group_info['next_group_state']),
+            (group_info['prev_group_state'] == group_info['next_group_state']) &
+            group_info['prev_group_state'].notna(),
             True,
             False
         )
-
-        group_info['prev_non_jump_group_state'] = df['state'].where(df['is_valid'])
-        df['prev_non_jump_group_state'] = df['valid_state'].ffill()
 
         print('Tower jumps detectados')
         print(group_info)
@@ -152,31 +177,28 @@ class TowerJumpAnalyzer:
         """Corrige falsos Tower Jumps usando group_state."""
         group_info = group_info.reset_index(drop=True)
         
-        # Estados adjacentes paar verificação de sanduíche
+        # # Estados adjacentes paar verificação de sanduíche
         group_info['prev_valid_state'] = group_info['group_state'].shift(1)
         group_info['next_valid_state'] = group_info['group_state'].shift(-1)
 
         # Condição: verifica se é um sanduíche válido
         mask = (
             group_info['tower_jump'] &
-            (group_info['prev_valid_state'] == group_info['next_valid_state']) & 
-            group_info['prev_valid_state'].notna() &
-            (group_info['group_state'] != group_info['prev_valid_state'])  # REGRA ADICIONADA
+            (group_info['prev_group_state'] == group_info['next_group_state']) & 
+            group_info['prev_group_state'].notna() &
+            (group_info['group_state'] != group_info['prev_group_state'])  # REGRA ADICIONADA
         )
         
         # Corrige o group_state para o valor do sanduíche
-        group_info.loc[mask, 'group_state'] = group_info.loc[mask, 'prev_valid_state']
+        group_info.loc[mask, 'group_state'] = group_info.loc[mask, 'prev_group_state']
         
         # Recalcula tower jumps usando group_state
-        group_info['prev_group_state'] = group_info['group_state'].shift()
-        group_info['tower_jump'] = (
-            (group_info['group_state'] != group_info['prev_group_state']) & 
-            group_info['prev_group_state'].notna()
+        group_info['sanduiche_prev_group_state'] = group_info['group_state'].shift()
+        group_info['sanduiche_tower_jump'] = (
+            (group_info['group_state'] != group_info['sanduiche_prev_group_state']) & 
+            group_info['sanduiche_prev_group_state'].notna()
         )
         
-        # Mantém apenas colunas necessárias
-        group_info = group_info.drop(columns=['prev_valid_state', 'next_valid_state'])
-
         print('Tower jumps com sanduíche ajustados')
         print(group_info)
 
@@ -184,10 +206,10 @@ class TowerJumpAnalyzer:
 
     def _map_group_info(self, df, group_info):
         """Mapeia informações do grupo de volta para o dataframe original."""
-        # Adiciona group_state às colunas para mapeamento
+
         map_cols = ['tower_jump', 'group_start_time', 'group_end_time', 'duration',
-                   'distance_km', 'time_diff', 'confidence', 'confidence_display',
-                   'group_state', 'prev_group_state']  # Novas colunas
+                   'distance_km', 'speed_kmh', 'time_diff', 'confidence', 'confidence_display',
+                   'group_state', 'prev_group_state', 'sanduiche_tower_jump']
 
         for col in map_cols:
             df[col] = df['group_id'].map(group_info.set_index('group_id')[col])
@@ -203,13 +225,13 @@ class TowerJumpAnalyzer:
         df = self._preprocess_dataframe(df)
         df = self._assign_group_ids(df)
         df, group_info = self._analyze_valid_groups(df)
+        group_info = self._detect_move(group_info)
 
         # Passo crítico com nova regra
-        group_info = self.adjust_sandwiched_jumps(group_info)
+        # group_info = self.adjust_sandwiched_jumps(group_info)
 
-        # Aplica correção de Tower Jumps sanduichados
-        # group_info = self.adjust_sandwiched_jumps(group_info)  # NOVO PASSO
-        group_info = self.calculate_confidence(group_info)     # Confiança após ajustes
+        group_info = self.adjust_sandwiched_jumps(group_info)
+        group_info = self.calculate_confidence(group_info) 
 
         df = self._map_group_info(df, group_info)
 
@@ -412,17 +434,25 @@ class TowerJumpAnalyzer:
                 df[f'{col}_str'] = df[col].dt.strftime(self.date_format)
             
             # 2. Formatar colunas numéricas específicas
-            # df['speed_str'] = df['speed'].apply(self.format_speed)
-            # df['distance_str'] = df['distance'].apply(self.format_distance)
+            df['speed_str'] = df['speed_kmh'].apply(self.format_speed)
+            df['distance_str'] = df['distance_km'].apply(self.format_distance)
             
             # 3. Preparar lista de todas as colunas para exportação
             all_columns = list(df.columns)
             
             # 4. Reordenar colunas para priorizar informações principais
+            # priority_columns = [
+            #     'start_time_str', 'end_time_str', 'is_valid', 'state', 'valid_state', 
+            #     'state_change', 'tower_jump', 'sanduiche_tower_jump', 'is_movement_possible', 
+            #     'distance_str', 'prev_valid_state', 
+            #     'fwd_valid_state', 'group_id', 'group_start_time', 'group_end_time', 'duration', 
+            # ]
+
             priority_columns = [
-                'start_time_str', 'end_time_str', 'is_valid', 'state', 'valid_state', 
-                'state_change', 'tower_jump', 'is_movement_possible', 'prev_valid_state', 
-                'fwd_valid_state', 'group_id', 'group_start_time', 'group_end_time', 'duration'
+                'group_start_time', 'group_end_time', 'is_valid', 'state', 'valid_state', 
+                'state_change', 'tower_jump', 'sanduiche_tower_jump', 'previous_state', 'prev_valid_state',
+                'group_state', 'next_group_state', 'fwd_valid_state', 'distance_str', 
+                'is_movement_possible', 'speed_str', 'confidence_display', 'group_id', 'duration', 
             ]
         
             # 5. Criar lista ordenada de colunas (prioritárias + demais)
